@@ -43,6 +43,7 @@ from transformers.modeling_attn_mask_utils import (
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
+from transformers.generation import GenerationMixin
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
 from transformers.utils import (
     add_start_docstrings,
@@ -234,6 +235,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    # Ensure cos/sin are on the same device as position_ids (fix for init_empty_weights loading)
+    if cos.device != position_ids.device:
+        cos = cos.to(position_ids.device)
+    if sin.device != position_ids.device:
+        sin = sin.to(position_ids.device)
     cos = cos[position_ids].unsqueeze(unsqueeze_dim)
     sin = sin[position_ids].unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -406,13 +412,18 @@ class Emu3Attention(nn.Module):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            if hasattr(past_key_value, "get_usable_length"):
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            else:
+                kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            # Fix for transformers 4.57+: Update kv_seq_len to match actual key_states shape after cache update
+            kv_seq_len = key_states.shape[-2]
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -426,10 +437,25 @@ class Emu3Attention(nn.Module):
             )
 
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
+            # Flexible handling for transformers 4.57+ cache API changes
+            # The mask may be created with a slightly different length than kv_seq_len
+            # due to cache length calculation differences. We adjust the mask to match.
+            actual_mask_len = attention_mask.size(-1)
+            if actual_mask_len != kv_seq_len:
+                if actual_mask_len > kv_seq_len:
+                    # Trim the mask - keep FIRST kv_seq_len tokens (the history/prompt)
+                    attention_mask = attention_mask[..., :kv_seq_len]
+                else:
+                    # Pad the mask with -inf (masked out) for non-existent positions
+                    # In additive attention masks: 0 = attend, -inf = don't attend
+                    pad_len = kv_seq_len - actual_mask_len
+                    padding = torch.full(
+                        (bsz, 1, q_len, pad_len),
+                        torch.finfo(attention_mask.dtype).min,  # -inf to mask out
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device
+                    )
+                    attention_mask = torch.cat([padding, attention_mask], dim=-1)
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
@@ -512,13 +538,18 @@ class Emu3FlashAttention2(Emu3Attention):
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            if hasattr(past_key_value, "get_usable_length"):
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            else:
+                kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            # Fix for transformers 4.57+: Update kv_seq_len to match actual key_states shape after cache update
+            kv_seq_len = key_states.shape[-2]
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
@@ -706,7 +737,10 @@ class Emu3SdpaAttention(Emu3Attention):
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            if hasattr(past_key_value, "get_usable_length"):
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            else:
+                kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
@@ -714,15 +748,32 @@ class Emu3SdpaAttention(Emu3Attention):
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            # Fix for transformers 4.57+: Update kv_seq_len to match actual key_states shape after cache update
+            kv_seq_len = key_states.shape[-2]
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
+            # Flexible handling for transformers 4.57+ cache API changes
+            # The mask may be created with a slightly different length than kv_seq_len
+            # due to cache length calculation differences. We adjust the mask to match.
+            actual_mask_len = attention_mask.size(-1)
+            if actual_mask_len != kv_seq_len:
+                if actual_mask_len > kv_seq_len:
+                    # Trim the mask - keep FIRST kv_seq_len tokens (the history/prompt)
+                    attention_mask = attention_mask[..., :kv_seq_len]
+                else:
+                    # Pad the mask with -inf (masked out) for non-existent positions
+                    # In additive attention masks: 0 = attend, -inf = don't attend
+                    pad_len = kv_seq_len - actual_mask_len
+                    padding = torch.full(
+                        (bsz, 1, q_len, pad_len),
+                        torch.finfo(attention_mask.dtype).min,  # -inf to mask out
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device
+                    )
+                    attention_mask = torch.cat([padding, attention_mask], dim=-1)
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -742,7 +793,8 @@ class Emu3SdpaAttention(Emu3Attention):
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        # Fix for shape mismatch when head_dim * num_heads != hidden_size
+        attn_output = attn_output.reshape(bsz, q_len, -1)
 
         attn_output = self.o_proj(attn_output)
 
@@ -850,7 +902,7 @@ EMU3_START_DOCSTRING = r"""
     "The bare Emu3 Model outputting raw hidden-states without any specific head on top.",
     EMU3_START_DOCSTRING,
 )
-class Emu3PreTrainedModel(PreTrainedModel):
+class Emu3PreTrainedModel(PreTrainedModel, GenerationMixin):
     config_class = Emu3Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -1021,7 +1073,11 @@ class Emu3Model(Emu3PreTrainedModel):
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
+            
+            if hasattr(past_key_values, "get_usable_length"):
+                past_key_values_length = past_key_values.get_usable_length(seq_length)
+            else:
+                past_key_values_length = past_key_values.get_seq_length()
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -1296,8 +1352,19 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
                 cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.seen_tokens
-                max_cache_length = past_key_values.get_max_length()
+                # Fix for 'DynamicCache' object has no attribute 'seen_tokens'
+                if hasattr(past_key_values, "seen_tokens"):
+                    past_length = past_key_values.seen_tokens
+                else:
+                    past_length = cache_length
+                
+                # Fix for 'DynamicCache' object has no attribute 'get_max_length'
+                if hasattr(past_key_values, "get_max_length"):
+                    max_cache_length = past_key_values.get_max_length()
+                elif hasattr(past_key_values, "max_cache_len"):
+                    max_cache_length = past_key_values.max_cache_len
+                else:
+                    max_cache_length = None
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None

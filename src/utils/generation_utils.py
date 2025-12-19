@@ -303,22 +303,36 @@ def multimodal_decode(
 def decode_image(image_string, tokenizer, vision_tokenizer):
     image: List[List[int]] = []
     image_rows = re.split(re.escape(tokenizer.eol_token), image_string)
-    for r in image_rows:
+    print(f"[decode_image DEBUG] EOL token: {repr(tokenizer.eol_token)}")
+    print(f"[decode_image DEBUG] Number of rows after split: {len(image_rows)}")
+    for i, r in enumerate(image_rows):
         token_ids = re.findall(r"<\|visual token (\d+)\|>", r)
         if len(token_ids) > 0:
             row_token = [int(m) for m in token_ids]
             image.append(row_token)
+            if i < 3:  # Debug first 3 rows
+                print(f"[decode_image DEBUG] Row {i}: {len(token_ids)} visual tokens, first 3: {token_ids[:3]}")
+    print(f"[decode_image DEBUG] Parsed {len(image)} valid rows")
+    if len(image) > 0:
+        row_lengths = [len(r) for r in image]
+        print(f"[decode_image DEBUG] Row lengths - min: {min(row_lengths)}, max: {max(row_lengths)}, unique: {set(row_lengths)}")
     try:
         image = torch.tensor(
             image, dtype=torch.long, device=next(iter(vision_tokenizer.parameters())).device
         )
         h, w = image.shape
+        print(f"[decode_image DEBUG] Image tensor shape (h, w): ({h}, {w})")
         image = vision_tokenizer.decode_code(image[None], shape=(1, h, w, 256)).float()
+        print(f"[decode_image DEBUG] After VQ decode: {image.shape}, range: [{image.min():.2f}, {image.max():.2f}]")
         image = image[0].permute(1, 2, 0)
+        print(f"[decode_image DEBUG] After permute: {image.shape}")
         image = Image.fromarray(
             ((image + 1.0) * 127.5).clamp(0, 255).detach().cpu().numpy().astype(np.uint8)
         )
+        print(f"[decode_image DEBUG] Final PIL image: {image.size}, mode: {image.mode}")
         return image
     except Exception as ex:
         print(f"decode image failed {ex}")
+        import traceback
+        traceback.print_exc()
         return None

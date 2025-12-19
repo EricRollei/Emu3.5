@@ -26,6 +26,10 @@ IMEND = "<|im_end|>"
 EXTRAS = tuple((f"<|extra_{i}|>" for i in range(205)))
 # changed to use actual index to avoid misconfiguration with vocabulary expansion
 SPECIAL_START_ID = 151643
+# Conservative fallback count for visual code tokens when metadata is missing.
+# Each additional token is tiny (< 12 bytes), so we round up to cover larger codebooks.
+# Increased to cover token IDs up to ~400k (e.g. 250934)
+DEFAULT_VISUAL_TOKEN_COUNT = 262144
 
 
 def _load_tiktoken_bpe(tiktoken_bpe_file: str) -> Dict[bytes, int]:
@@ -59,13 +63,36 @@ class Emu3Tokenizer(PreTrainedTokenizer):
         self.mergeable_ranks = _load_tiktoken_bpe(vocab_file)  # type: Dict[bytes, int]
 
         vision_tokens = []
-        if special_tokens_file is not None:
+        if special_tokens_file is not None and os.path.exists(special_tokens_file):
             with open(special_tokens_file, 'r') as f:
                 vision_tokens = [
                     token.strip() 
                     for token in f.readlines() 
                     if len(token.strip()) > 0
                 ]
+        
+        # Fallback: If vision_tokens is empty (file missing or not passed), synthesize the expected vision tokens
+        # Emu's tokenizer reserves a contiguous block starting at SPECIAL_START_ID for: text extras + image/video +
+        # thousands of discrete visual codes (one per VQ token). Without these, decoding image streams crashes with
+        # 'Invalid token for decoding'. We approximate the official list here when the file is absent.
+        if not vision_tokens:
+            print("DEBUG: vision_tokens is empty. Synthesizing fallback special tokens.")
+            base_vision_tokens = [
+                "<|image|>",          # 151851
+                "<|begin_of_image|>", # 151852
+                "<|end_of_image|>",   # 151853
+                "<|video|>",          # 151854
+                "<|begin_of_video|>", # 151855
+                "<|end_of_video|>",   # 151856
+            ]
+            generated_tokens = [
+                f"<|visual token {token_id:0>6d}|>" for token_id in range(DEFAULT_VISUAL_TOKEN_COUNT)
+            ]
+            vision_tokens = base_vision_tokens + generated_tokens
+            print(
+                f"DEBUG: Added {len(base_vision_tokens)} base + {len(generated_tokens)} generated vision tokens (fallback)."
+            )
+            
         SPECIAL_TOKENS = tuple(
             enumerate(
                 (

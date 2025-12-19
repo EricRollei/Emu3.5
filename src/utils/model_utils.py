@@ -18,10 +18,9 @@ def build_emu3p5(
     vq_device="cuda:0",
     **kwargs,
 ):
-    if isinstance(model_device, int):
-        device_map = f"cuda:{model_device}"
-    else:
-        device_map = model_device
+    # Force single GPU to avoid memory split across devices
+    device_map = "cuda:0"  # Always use GPU 0
+    print(f"Forcing device_map to: {device_map}")
 
     print(device_map)
 
@@ -35,9 +34,11 @@ def build_emu3p5(
         config=model_config,
         torch_dtype=torch.bfloat16,
         device_map=device_map,
-        attn_implementation="flash_attention_2",
-        # attn_implementation="eager", # if you cann't install flash_attention
-    )
+        # attn_implementation="flash_attention_2",  # Not available on Blackwell
+        # attn_implementation="sdpa",  # We've been using this - produces noise
+        attn_implementation="eager",  # Try standard PyTorch attention
+    )  # attn_implementation="eager", # if you cann't install flash_attention
+    
     model.eval()
     
     # text tokenizer
